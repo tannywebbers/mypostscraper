@@ -3,33 +3,37 @@
 """
 copybot.py - single-file interactive Telegram copy bot.
 
-Run:  pip install telethon
-Then: python copybot.py
+Run locally:   pip install -r requirements.txt   then   python copybot.py
+Run on Render: set the environment variables below and use start command
+               `python copybot.py` (a tiny health server binds $PORT so
+               Render's Web Service port scan passes).
 
-Startup:
-  - Logs in once as YOUR account (session saved to copybot_config.json).
-  - Starts the bot and sends you a menu with buttons.
+Credentials (never hardcode, never commit):
+    API_ID, API_HASH      from https://my.telegram.org
+    BOT_TOKEN             from @BotFather
+    TARGET_USER           your numeric Telegram user id
+    SESSION_STRING        saved user session (log in once locally to get it)
+    SOURCE_URL            optional, channel @username / -100... id / web link
+    POLL_INTERVAL         optional, seconds between polls (default 60)
+
+Any of these missing from the environment fall back to copybot_config.json,
+and finally to an interactive prompt when running in a terminal.
 
 Menu / features:
-  Read posts    - walks the saved posts one at a time.
-  Each post message has:
-      [ Copy ]   [ Delete ]     copy text / remove this post
-      [ <  3/12  > ]            prev / position / next (number lives on the
-                                buttons, never inside the content)
-      [ Menu ]
-  Scrape new    - fetch posts added since the last run.
-  Polling       - background loop that keeps checking for new posts.
-  Change source - switch the channel / id to fetch from.
-  Stats         - post count, last scrape time, source.
-  Delete all    - wipe saved posts (with confirmation).
-  Log out       - forget the saved session.
-  Close         - remove the menu message.
+    Read posts    - walks the saved posts one at a time (Copy / Delete / nav).
+    Scrape new    - fetch posts added since the last run.
+    Polling       - background loop that keeps checking for new posts.
+    Change source - switch the channel / id to fetch from.
+    Stats         - post count, last scrape time, source.
+    Delete all    - wipe saved posts (with confirmation).
+    Log out       - forget the saved session.
+    Close         - remove the menu message.
 
 The bot deletes its previous screen every time it shows a new one, so the
 chat only ever contains the message you are currently looking at.
 
 Security note: copybot_config.json holds your session string and bot token.
-Never commit or share it.
+It is listed in .gitignore. Never commit or share it.
 """
 
 import asyncio
@@ -51,22 +55,32 @@ try:
         InlineButtonTypeCallback,
     )
 except ImportError:
-    sys.stderr.write("Missing dependency. Run:  pip install telethon\n")
+    sys.stderr.write(
+        "Missing or outdated dependency. Run: pip install -U -r requirements.txt\n"
+    )
     raise SystemExit(1)
 
-
 SOURCE_URL = "https://web.telegram.org/k/#-2947341412"
-DEFAULT_BOT_TOKEN = "7948436071:AAEu2OOnLbDvRuqmOPyOIXWuI8mWxjHCEuk"
-DEFAULT_TARGET_USER = "1382903506"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(HERE, "copybot_config.json")
 POSTS_FILE = os.path.join(HERE, "copybot_posts.json")
+
 MAX_LEN = 4000
+DEFAULT_HEALTH_PORT = 10000
+
+ENV_TO_CONFIG = (
+    ("API_ID", "api_id"),
+    ("API_HASH", "api_hash"),
+    ("BOT_TOKEN", "bot_token"),
+    ("TARGET_USER", "target_user"),
+    ("SESSION_STRING", "session_string"),
+    ("SOURCE_URL", "source"),
+)
 
 
 def log(msg):
-    print("[{}] {}".format(datetime.now().strftime("%H:%M:%S"), msg))
+    print("[{}] {}".format(datetime.now().strftime("%H:%M:%S"), msg), flush=True)
 
 
 def load_json(path, default):
@@ -81,9 +95,22 @@ def load_json(path, default):
 
 def save_json(path, data):
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log("Could not write {} ({}).".format(os.path.basename(path), exc))
+
+
+def ask(prompt, what):
+    try:
+        return input(prompt).strip()
+    except EOFError:
+        raise SystemExit(
+            "Missing {} and no terminal is attached to ask for it. "
+            "Set it as an environment variable or put it in copybot_config.json.".format(what)
+        )
 
 
 def parse_source_id(value):
@@ -117,24 +144,39 @@ def load_config():
     cfg = load_json(CONFIG_FILE, {})
     changed = False
 
-    if not cfg.get("api_id") or not cfg.get("api_hash"):
-        print("First run - enter your Telegram API credentials from https://my.telegram.org")
-        cfg["api_id"] = cfg.get("api_id") or input("api_id: ").strip()
-        cfg["api_hash"] = cfg.get("api_hash") or input("api_hash: ").strip()
+    for env_key, cfg_key in ENV_TO_CONFIG:
+        value = os.environ.get(env_key, "").strip()
+        if value and cfg.get(cfg_key) != value:
+            cfg[cfg_key] = value
+            changed = True
+
+    env_poll = os.environ.get("POLL_INTERVAL", "").strip()
+    if env_poll.isdigit() and cfg.get("poll_interval") != int(env_poll):
+        cfg["poll_interval"] = int(env_poll)
         changed = True
 
-    for key, value in (
-        ("source", SOURCE_URL),
-        ("bot_token", DEFAULT_BOT_TOKEN),
-        ("target_user", DEFAULT_TARGET_USER),
-    ):
-        if not cfg.get(key):
-            cfg[key] = value
-            changed = True
+    if not cfg.get("api_id") or not cfg.get("api_hash"):
+        print("First run - enter your Telegram API credentials from https://my.telegram.org")
+        cfg["api_id"] = cfg.get("api_id") or ask("api_id: ", "API_ID")
+        cfg["api_hash"] = cfg.get("api_hash") or ask("api_hash: ", "API_HASH")
+        changed = True
+
+    if not cfg.get("bot_token"):
+        cfg["bot_token"] = ask("Bot token from @BotFather: ", "BOT_TOKEN")
+        changed = True
+
+    if not cfg.get("target_user"):
+        cfg["target_user"] = ask("Your numeric Telegram user id: ", "TARGET_USER")
+        changed = True
+
+    if not cfg.get("source"):
+        cfg["source"] = SOURCE_URL
+        changed = True
 
     if "first_run_limit" not in cfg:
         cfg["first_run_limit"] = None
         changed = True
+
     if "poll_interval" not in cfg:
         cfg["poll_interval"] = 60
         changed = True
@@ -152,6 +194,30 @@ def fresh_store():
         "last_read_index": 0,
         "posts": [],
     }
+
+
+async def start_health_server():
+    port = int(os.environ.get("PORT", DEFAULT_HEALTH_PORT))
+    response = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"Content-Length: 2\r\n"
+        b"Connection: close\r\n\r\nok"
+    )
+
+    async def handle(reader, writer):
+        try:
+            await asyncio.wait_for(reader.read(1024), timeout=5)
+            writer.write(response)
+            await writer.drain()
+        except (asyncio.TimeoutError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "0.0.0.0", port)
+    log("Health server listening on port {}.".format(port))
+    return server
 
 
 async def resolve_entity(client, source):
@@ -184,7 +250,6 @@ async def login_user_client(cfg):
             cfg["api_hash"],
         )
         await client.connect()
-
         if await client.is_user_authorized():
             log("Re-using saved session.")
             cfg["session_string"] = client.session.save()
@@ -192,19 +257,18 @@ async def login_user_client(cfg):
             return client
 
         log("No valid session found, please log in.")
-        phone = input("Phone (international format, e.g. +234...): ").strip()
+        phone = ask("Phone (international format, e.g. +234...): ", "SESSION_STRING")
         try:
             await client.send_code_request(phone)
         except Exception as exc:
             log("Could not send code: {}".format(exc))
             await client.disconnect()
             continue
-
-        code = input("Login code: ").strip()
+        code = ask("Login code: ", "login code")
         try:
             await client.sign_in(phone=phone, code=code)
         except SessionPasswordNeededError:
-            password = input("Two-factor password: ").strip()
+            password = ask("Two-factor password: ", "two-factor password")
             await client.sign_in(password=password)
         except Exception as exc:
             log("Login failed: {}. Let's try again.".format(exc))
@@ -271,7 +335,6 @@ class CopyBot:
             "\u2022 Last scraped: {}\n"
             "\u2022 Polling: {}"
         ).format(src, len(self.store["posts"]), last, "ON" if self.polling else "OFF")
-
         rows = [
             [cbtn("\u25B6\uFE0F Read posts", "read", KeyboardButtonStyle(bg_success=True))],
             [cbtn("\U0001F4E5 Scrape new", "scrape", KeyboardButtonStyle(bg_primary=True))],
@@ -303,12 +366,14 @@ class CopyBot:
             cbtn("\u25B6", "post:{}".format(idx + 1), KeyboardButtonStyle(bg_primary=True)),
         ])
         menu_row = KeyboardInlineButtonRow(buttons=[cbtn("\U0001F3E0 Menu", "menu")])
+
         full = ReplyInlineMarkup(rows=[action_row, nav_row, menu_row])
         no_copy = ReplyInlineMarkup(rows=[
             KeyboardInlineButtonRow(buttons=[action_row.buttons[1]]),
             nav_row,
             menu_row,
         ])
+
         await self._delete_screen()
         await self._emit(text, full, no_copy)
         self.store["last_read_index"] = idx
@@ -560,6 +625,7 @@ class CopyBot:
 
 
 async def main():
+    health = await start_health_server()
     cfg = load_config()
     store = load_json(POSTS_FILE, fresh_store())
     user = await login_user_client(cfg)
@@ -567,6 +633,7 @@ async def main():
         await CopyBot(cfg, user, store).run()
     finally:
         await user.disconnect()
+        health.close()
 
 
 if __name__ == "__main__":
